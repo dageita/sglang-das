@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import (
@@ -149,6 +150,15 @@ _use_lightop_topk_ids_postprocess = get_bool_env_var(
 )
 _use_fused_topk_softmax = get_bool_env_var("SGLANG_USE_FUSED_TOPK_SOFTMAX")
 _simulated_expert_balance = envs.SGLANG_SIMULATED_EXPERT_BALANCE.get()
+_single_hcu_topk_postprocess = get_bool_env_var("SGLANG_HCU_SINGLE_TOPK_POSTPROCESS", "false")
+_direct_hcu_topk_postprocess = get_bool_env_var("SGLANG_HCU_DIRECT_TOPK_POSTPROCESS", "false")
+_fused_hcu_topk64 = get_bool_env_var("SGLANG_HCU_FUSED_TOPK64", "false")
+_fused_hcu_validate = int(os.getenv("SGLANG_HCU_FUSED_TOPK64_VALIDATE", "0"))
+_fused_hcu_checked = {}
+if _direct_hcu_topk_postprocess and _is_hcu:
+    from sglang.srt.batch_overlap.topk_pad_cast_direct import try_pad_cast
+if _fused_hcu_topk64 and _is_hcu:
+    from sglang.srt.batch_overlap.fused_topk64 import route as _route_topk64
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -2052,6 +2062,12 @@ def _topk_ids_postprocess(
     num_token_non_padded: Optional[torch.Tensor],
     output_int64: bool = False,
 ) -> torch.Tensor:
+    if _direct_hcu_topk_postprocess and _is_hcu:
+        direct = try_pad_cast(
+            topk_ids, num_token_non_padded, expert_location_dispatch_info, output_int64
+        )
+        if direct is not None:
+            return direct
     if (
         expert_location_dispatch_info is None
         and num_token_non_padded is None
@@ -2946,6 +2962,7 @@ def select_experts(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     dynamic_expert_bias: Optional[torch.Tensor] = None,
     router_logits_partials: Optional[torch.Tensor] = None,
+    _skip_fused_topk64: bool = False,
 ) -> StandardTopKOutput:
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
@@ -3024,6 +3041,45 @@ def select_experts(
         correction_bias=correction_bias,
         info=expert_location_dispatch_info,
     )
+
+    # Experimental plain-softmax HCU path. Preserve dynamic bias, partial-router,
+    # observer and simulated-routing semantics by retaining the original path.
+    if (
+        _fused_hcu_topk64 and not _skip_fused_topk64 and _is_hcu and _is_hip
+        and not _is_cuda and not _use_aiter and not _use_fused_topk_softmax
+        and not torch_native and not use_grouped_topk
+        and correction_bias is None and dynamic_expert_bias is None
+        and router_logits_partials is None and custom_routing_function is None
+        and scoring_func == "softmax" and num_fused_shared_experts == 0
+        and not apply_routed_scaling_factor_on_output
+        and expert_location_dispatch_info is None
+        and get_moe_a2a_backend().is_deepep()
+        and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
+        and not routing_overridden and get_global_experts_capturer() is None
+    ):
+        fused = _route_topk64(router_logits, num_token_non_padded, top_k, renormalize)
+        if fused is not None:
+            weights, ids = fused
+            checked = _fused_hcu_checked.get(layer_id, 0)
+            if router_logits.shape[0] >= 8 and checked < _fused_hcu_validate:
+                reference = select_experts(
+                    hidden_states, router_logits, topk_config, layer_id=layer_id,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=None, _skip_fused_topk64=True,
+                )
+                passed = (
+                    torch.equal(ids, reference.topk_ids)
+                    and torch.isfinite(weights).all().item()
+                    and torch.allclose(weights, reference.topk_weights, rtol=2e-5, atol=2e-6)
+                )
+                logger.info("FUSED_TOPK64_CHECK layer=%s rows=%s passed=%s",
+                            layer_id, router_logits.shape[0], passed)
+                if not passed:
+                    raise RuntimeError("Fused TopK64 differs from source HIP TopK")
+                _fused_hcu_checked[layer_id] = checked + 1
+            else:
+                get_global_expert_distribution_recorder().on_select_experts(topk_ids=ids)
+            return StandardTopKOutput(weights, ids, router_logits)
 
     # Only aiter_biased_grouped_topk wants the bias in the gating dtype. The JIT
     # router returns before it in biased_grouped_topk_gpu and upcasts the bias
@@ -3254,7 +3310,18 @@ def select_experts(
             # the fused TopK path consistent with the existing HCU biased and
             # grouped TopK paths by applying EPLB logical-to-physical mapping
             # here exactly once.
-            if _is_hcu and (
+            defer_padding = (
+                _single_hcu_topk_postprocess and _is_hcu and _is_hip
+                and not _is_cuda and not _use_aiter
+                and expert_location_dispatch_info is None
+                and num_fused_shared_experts == 0
+                and get_moe_a2a_backend().is_deepep()
+                and (get_moe_runner_backend().is_deep_gemm() or _use_deepgemm_moe)
+                and not routing_overridden
+                and (not topk_config.allow_routed_experts_capture
+                     or get_global_experts_capturer() is None)
+            )
+            if _is_hcu and not defer_padding and (
                 expert_location_dispatch_info is not None
                 or num_token_non_padded is not None
             ):

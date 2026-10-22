@@ -361,6 +361,11 @@ class FlashAttentionBackend(AttentionBackend):
         # HCU uses its established FlashAttention interface and must not
         # select CUDA-only FA3/FA4 wrappers.
         self.fa_impl_ver = fa_impl_ver
+        # Only selected FA4 SM120 policies use a graph-captured, static
+        # max_seqlen_k. HCU/FA3 use the live sequence length. Keep an explicit
+        # default because CUDA graph metadata setup reads this flag for every
+        # backend, including HCU, before any FA4 policy can override it.
+        self._decode_uses_static_max_seqlen_k = False
         if is_hcu():
             self._get_scheduler_metadata = None
         elif self.fa_impl_ver == 3:
@@ -442,7 +447,7 @@ class FlashAttentionBackend(AttentionBackend):
         # combine kernel (flash_fwd_combine_launch_template.h:52). Leaving
         # scheduler_metadata unset uses the existing per-layer metadata path.
         self._disable_scheduler_metadata_precompute = (
-            _should_disable_scheduler_metadata_precompute(server_args)
+            _should_disable_scheduler_metadata_precompute()
         )
 
     def _maybe_init_local_attn_builder(

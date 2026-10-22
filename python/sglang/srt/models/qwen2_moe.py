@@ -595,8 +595,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
-            if enable_dual_stream:
+            from sglang.srt.batch_overlap.prefill_router_shared_graph import (
+                maybe_run_prefill_router_shared,
+            )
+
+            island = None
+            if not enable_dual_stream and not enable_cuda_shared_overlap:
+                island = maybe_run_prefill_router_shared(
+                    self, hidden_states, forward_batch
+                )
+            if island is None:
+                router_logits, _ = self.gate(hidden_states)
+            else:
+                router_logits, shared_output = island
+            if island is not None:
+                pass  # The shared expert result is already produced by the graph.
+            elif enable_dual_stream:
                 from sglang.srt.hardware_backend.npu.cmo import (
                     shared_expert_on_independent_stream,
                     wait_share_stream,
