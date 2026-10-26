@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: bash run_prefill_variant.sh installed|legacy|source off|graph|coverage|fused -- command args...
+# Usage: bash run_prefill_variant.sh installed|legacy|source off|graph|graph-multi|topk|coverage|fused -- command args...
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 VERSION=${1:?version required}
@@ -30,13 +30,14 @@ export SGLANG_HCU_FUSED_TOPK64=0
 export SGLANG_PREFILL_ROUTER_SHARED_GRAPH_TARGET_TOKENS=32
 export SGLANG_PREFILL_ROUTER_SHARED_GRAPH_MAX_TOKENS=128
 export SGLANG_HCU_DIRECT_TOPK_MAX_ROWS=128
-export SGLANG_PREFILL_ISLAND_AUDIT=${SGLANG_PREFILL_ISLAND_AUDIT:-0}
-export SGLANG_PREFILL_ISLAND_VALIDATE_CALLS=${SGLANG_PREFILL_ISLAND_VALIDATE_CALLS:-0}
-export SGLANG_HCU_FUSED_TOPK64_VALIDATE=${SGLANG_HCU_FUSED_TOPK64_VALIDATE:-0}
-case "$MODE" in
-  off) ;;
-  graph) export SGLANG_PREFILL_ROUTER_SHARED_GRAPH=1 ;;
-  coverage|fused)
+# Performance variants must never inherit expensive per-call diagnostics from
+# the parent shell. Override after `--` with `env NAME=value` for a diagnostic run.
+export SGLANG_PREFILL_ISLAND_AUDIT=0
+export SGLANG_PREFILL_ISLAND_VALIDATE_CALLS=0
+export SGLANG_HCU_FUSED_TOPK64_VALIDATE=0
+export SGLANG_PREFILL_GRAPH_STATS_INTERVAL=128
+
+enable_multi_shape_graph() {
     export SGLANG_PREFILL_ROUTER_SHARED_GRAPH=1
     export SGLANG_PREFILL_GRAPH_MULTI_SHAPE=1
     export SGLANG_PREFILL_ROUTER_SHARED_GRAPH_MAX_TOKENS=2048
@@ -45,14 +46,29 @@ case "$MODE" in
     export SGLANG_PREFILL_GRAPH_MIN_SEEN=3
     export SGLANG_PREFILL_GRAPH_MIN_TOKENS=8
     export SGLANG_PREFILL_GRAPH_FREE_MB=2048
+}
+
+enable_topk() {
+    export SGLANG_HCU_SINGLE_TOPK_POSTPROCESS=1
+    export SGLANG_HCU_DIRECT_TOPK_POSTPROCESS=1
+    export SGLANG_HCU_DIRECT_TOPK_MAX_ROWS=65536
+    export SGLANG_HCU_FUSED_TOPK64=1
+}
+case "$MODE" in
+  off) ;;
+  graph) export SGLANG_PREFILL_ROUTER_SHARED_GRAPH=1 ;;
+  graph-multi) enable_multi_shape_graph ;;
+  topk) enable_topk ;;
+  coverage|fused)
+    enable_multi_shape_graph
     export SGLANG_HCU_SINGLE_TOPK_POSTPROCESS=1
     export SGLANG_HCU_DIRECT_TOPK_POSTPROCESS=1
     export SGLANG_HCU_DIRECT_TOPK_MAX_ROWS=65536
     if [[ "$MODE" == fused ]]; then export SGLANG_HCU_FUSED_TOPK64=1; fi
     ;;
-  *) echo 'mode: off|graph|coverage|fused' >&2; exit 2 ;;
+  *) echo 'mode: off|graph|graph-multi|topk|coverage|fused' >&2; exit 2 ;;
 esac
-echo "PREFILL_VARIANT version=$VERSION mode=$MODE root=$ROOT"
+echo "PREFILL_VARIANT version=$VERSION mode=$MODE root=$ROOT stats_interval=$SGLANG_PREFILL_GRAPH_STATS_INTERVAL"
 # Keep cwd from shadowing the selected package. Pass absolute script paths.
 cd /tmp
 python3 -c 'import sglang; print("SGLang:", sglang.__file__, flush=True)'
