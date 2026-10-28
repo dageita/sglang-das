@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: bash run_prefill_variant.sh installed|legacy|source off|graph|graph-multi|topk|coverage|fused -- command args...
+# Usage: bash run_prefill_variant.sh installed|legacy|source off|graph|graph-multi|adaptive|topk|coverage|fused -- command args...
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 VERSION=${1:?version required}
@@ -24,6 +24,7 @@ case "$VERSION" in
 esac
 export SGLANG_PREFILL_ROUTER_SHARED_GRAPH=0
 export SGLANG_PREFILL_GRAPH_MULTI_SHAPE=0
+export SGLANG_PREFILL_GRAPH_ADAPTIVE=0
 export SGLANG_HCU_SINGLE_TOPK_POSTPROCESS=0
 export SGLANG_HCU_DIRECT_TOPK_POSTPROCESS=0
 export SGLANG_HCU_FUSED_TOPK64=0
@@ -58,6 +59,20 @@ case "$MODE" in
   off) ;;
   graph) export SGLANG_PREFILL_ROUTER_SHARED_GRAPH=1 ;;
   graph-multi) enable_multi_shape_graph ;;
+  adaptive)
+    enable_multi_shape_graph
+    export SGLANG_PREFILL_GRAPH_ADAPTIVE=1
+    export SGLANG_PREFILL_GRAPH_BUCKETS=512,1024,1536,2048
+    export SGLANG_PREFILL_GRAPH_MAX_SHAPES=4
+    export SGLANG_PREFILL_GRAPH_TOKEN_BUDGET=5120
+    export SGLANG_PREFILL_GRAPH_MAX_PADDING_ROWS=64
+    export SGLANG_PREFILL_GRAPH_MAX_PADDING_RATIO=0.03
+    export SGLANG_PREFILL_GRAPH_MEMORY_MB=2048
+    export SGLANG_PREFILL_GRAPH_FREE_MB=4096
+    export SGLANG_PREFILL_GRAPH_VERIFY_PADDING=1
+    export SGLANG_PREFILL_GRAPH_PADDING_VERIFY_CALLS=2
+    export SGLANG_PREFILL_GRAPH_STATS_INTERVAL=32
+    ;;
   topk) enable_topk ;;
   coverage|fused)
     enable_multi_shape_graph
@@ -66,7 +81,7 @@ case "$MODE" in
     export SGLANG_HCU_DIRECT_TOPK_MAX_ROWS=65536
     if [[ "$MODE" == fused ]]; then export SGLANG_HCU_FUSED_TOPK64=1; fi
     ;;
-  *) echo 'mode: off|graph|graph-multi|topk|coverage|fused' >&2; exit 2 ;;
+  *) echo 'mode: off|graph|graph-multi|adaptive|topk|coverage|fused' >&2; exit 2 ;;
 esac
 echo "PREFILL_VARIANT version=$VERSION mode=$MODE root=$ROOT stats_interval=$SGLANG_PREFILL_GRAPH_STATS_INTERVAL"
 # Keep cwd from shadowing the selected package. Pass absolute script paths.
